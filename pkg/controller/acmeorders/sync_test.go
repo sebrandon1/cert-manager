@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -42,6 +43,7 @@ import (
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	cmfake "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/fake"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	schedulertest "github.com/cert-manager/cert-manager/pkg/scheduler/test"
@@ -330,6 +332,8 @@ Dfvp7OOGAN6dEOM4+qR9sdjoSYKEBpsr6GtPAQw4dy753ec5
 	testAuthorizationChallengeValid.Status.State = cmacme.Valid
 	testAuthorizationChallengeInvalid := testAuthorizationChallenge.DeepCopy()
 	testAuthorizationChallengeInvalid.Status.State = cmacme.Invalid
+	testLeftoverChallenge := testAuthorizationChallenge.DeepCopy()
+	testLeftoverChallenge.Name = "leftover-challenge"
 
 	testACMEAuthorizationPending := &acmeapi.Authorization{
 		URI:    "http://authzurl",
@@ -648,6 +652,39 @@ Dfvp7OOGAN6dEOM4+qR9sdjoSYKEBpsr6GtPAQw4dy753ec5
 				},
 			},
 		},
+		"delete leftover challenge resources that are no longer required by the order": {
+			order: testOrderPending,
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{testIssuerHTTP01TestCom, testOrderPending, testAuthorizationChallenge, testLeftoverChallenge},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewDeleteAction(cmacme.SchemeGroupVersion.WithResource("challenges"), testLeftoverChallenge.Namespace, testLeftoverChallenge.Name)),
+				},
+			},
+			acmeClient: &acmecl.FakeACME{
+				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
+					return "key", nil
+				},
+			},
+		},
+		"delete leftover challenges before creating replacements when the required set has changed": {
+			order: testOrderPending,
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{testIssuerHTTP01TestCom, testOrderPending, testLeftoverChallenge},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewDeleteAction(cmacme.SchemeGroupVersion.WithResource("challenges"), testLeftoverChallenge.Namespace, testLeftoverChallenge.Name)),
+					testpkg.NewAction(coretesting.NewCreateAction(cmacme.SchemeGroupVersion.WithResource("challenges"), testAuthorizationChallenge.Namespace, testAuthorizationChallenge)),
+				},
+				ExpectedEvents: []string{
+					//nolint: dupword
+					`Normal Created Created Challenge resource "testorder-2580184217" for domain "test.com"`,
+				},
+			},
+			acmeClient: &acmecl.FakeACME{
+				FakeHTTP01ChallengeResponse: func(s string) (string, error) {
+					return "key", nil
+				},
+			},
+		},
 		"do nothing if the challenge for test.com is still pending": {
 			order: testOrderPending,
 			builder: &testpkg.Builder{
@@ -950,6 +987,16 @@ Dfvp7OOGAN6dEOM4+qR9sdjoSYKEBpsr6GtPAQw4dy753ec5
 			},
 			acmeClient: &acmecl.FakeACME{},
 		},
+		"delete owned challenge resources when the order is valid and the certificate is stored": {
+			order: testOrderValid,
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{testIssuerHTTP01TestCom, testOrderValid, testAuthorizationChallenge},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewDeleteAction(cmacme.SchemeGroupVersion.WithResource("challenges"), testAuthorizationChallenge.Namespace, testAuthorizationChallenge.Name)),
+				},
+			},
+			acmeClient: &acmecl.FakeACME{},
+		},
 		"do nothing if the order is invalid": {
 			order: testOrderInvalid,
 			builder: &testpkg.Builder{
@@ -1080,6 +1127,31 @@ Dfvp7OOGAN6dEOM4+qR9sdjoSYKEBpsr6GtPAQw4dy753ec5
 			}
 			runTest(t, test)
 		})
+	}
+}
+
+func TestDeleteChallengesIgnoresNotFound(t *testing.T) {
+	existing := &cmacme.Challenge{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "existing-challenge",
+			Namespace: gen.DefaultTestNamespace,
+		},
+	}
+	missing := &cmacme.Challenge{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "already-gone",
+			Namespace: gen.DefaultTestNamespace,
+		},
+	}
+	c := &controller{cmClient: cmfake.NewClientset(existing)}
+
+	if err := c.deleteChallenges(t.Context(), []*cmacme.Challenge{missing, existing}); err != nil {
+		t.Fatalf("expected deleteChallenges to ignore NotFound, got: %v", err)
+	}
+
+	_, err := c.cmClient.AcmeV1().Challenges(existing.Namespace).Get(t.Context(), existing.Name, metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected existing challenge to be deleted, got: %v", err)
 	}
 }
 

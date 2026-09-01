@@ -143,17 +143,26 @@ func (c *controller) Sync(ctx context.Context, o *cmacme.Order) (err error) {
 		return err
 	}
 
-	switch {
-	case needToCreateChallenges:
-		log.V(logf.DebugLevel).Info("Creating additional Challenge resources to complete Order")
-		requiredChallenges, err = ensureKeysForChallenges(cl, requiredChallenges)
-		if err != nil {
-			return err
+	// Delete leftover Challenges before creating replacements so stale
+	// solver objects are not left in place. Return afterwards: the
+	// informer cache still contains just-deleted Challenges, whose status
+	// must not be used to update the Order.
+	if needToDeleteChallenges || needToCreateChallenges {
+		if needToDeleteChallenges {
+			log.V(logf.DebugLevel).Info("Deleting leftover Challenge resources no longer required by Order")
+			if err := c.deleteLeftoverChallenges(ctx, o, requiredChallenges); err != nil {
+				return err
+			}
 		}
-		return c.createRequiredChallenges(ctx, o, requiredChallenges)
-	case needToDeleteChallenges:
-		log.V(logf.DebugLevel).Info("Deleting leftover Challenge resources no longer required by Order")
-		return c.deleteLeftoverChallenges(ctx, o, requiredChallenges)
+		if needToCreateChallenges {
+			log.V(logf.DebugLevel).Info("Creating additional Challenge resources to complete Order")
+			requiredChallenges, err = ensureKeysForChallenges(cl, requiredChallenges)
+			if err != nil {
+				return err
+			}
+			return c.createRequiredChallenges(ctx, o, requiredChallenges)
+		}
+		return nil
 	}
 
 	// we know that this list only contains the 'required' challenges as we use
@@ -488,13 +497,7 @@ func (c *controller) deleteLeftoverChallenges(ctx context.Context, o *cmacme.Ord
 		return err
 	}
 
-	for _, ch := range leftover {
-		if err := c.cmClient.AcmeV1().Challenges(ch.Namespace).Delete(ctx, ch.Name, metav1.DeleteOptions{}); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return c.deleteChallenges(ctx, leftover)
 }
 
 func (c *controller) deleteAllChallenges(ctx context.Context, o *cmacme.Order) error {
@@ -503,8 +506,16 @@ func (c *controller) deleteAllChallenges(ctx context.Context, o *cmacme.Order) e
 		return err
 	}
 
+	return c.deleteChallenges(ctx, challenges)
+}
+
+func (c *controller) deleteChallenges(ctx context.Context, challenges []*cmacme.Challenge) error {
 	for _, ch := range challenges {
-		if err := c.cmClient.AcmeV1().Challenges(ch.Namespace).Delete(ctx, ch.Name, metav1.DeleteOptions{}); err != nil {
+		err := c.cmClient.AcmeV1().Challenges(ch.Namespace).Delete(ctx, ch.Name, metav1.DeleteOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
 			return err
 		}
 	}
